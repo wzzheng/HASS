@@ -1,12 +1,14 @@
 import os
-
+import pickle
 import torch
 import copy
-
 from pcdet.datasets.augmentor.augmentor_utils import *
 from pcdet.ops.iou3d_nms import iou3d_nms_utils
 from .detector3d_template import Detector3DTemplate
-from.pv_rcnn import PVRCNN
+from .pv_rcnn import PVRCNN
+from pcdet.ops.roiaware_pool3d import roiaware_pool3d_utils
+from ...utils import box_utils
+from pathlib import Path
 
 
 class PVRCNN_SSL(Detector3DTemplate):
@@ -32,6 +34,11 @@ class PVRCNN_SSL(Detector3DTemplate):
         self.unlabeled_weight = model_cfg.UNLABELED_WEIGHT
         self.no_nms = model_cfg.NO_NMS
         self.supervise_mode = model_cfg.SUPERVISE_MODE
+        self.data_path = '../data/kitti'
+        self.root_path = Path(self.data_path)
+        self.dbinfo_path = self.root_path / ('10%_2_6conf-based_trained.pkl')
+        with open(self.dbinfo_path, 'rb') as f:
+            self.all_db_infos = pickle.load(f)
 
     def forward(self, batch_dict):
         if self.training:
@@ -48,6 +55,10 @@ class PVRCNN_SSL(Detector3DTemplate):
                     batch_dict_ema[k[:-4]] = batch_dict[k]
                 else:
                     batch_dict_ema[k] = batch_dict[k]
+            un_batch_indices = batch_dict_ema['points'][:, 0].long()
+            source_points = batch_dict_ema['points'][:, 1:5]
+            un_bs_mask = (un_batch_indices == 1)
+            un_pot = source_points[un_bs_mask].unsqueeze(dim=0)
 
             with torch.no_grad():
                 # self.pv_rcnn_ema.eval()  # Important! must be in train mode
@@ -67,39 +78,94 @@ class PVRCNN_SSL(Detector3DTemplate):
                 for ind in unlabeled_mask:
                     pseudo_score = pred_dicts[ind]['pred_scores']
                     pseudo_box = pred_dicts[ind]['pred_boxes']
+                    new_box = pred_dicts[ind]['pred_boxes'].clone()
                     pseudo_label = pred_dicts[ind]['pred_labels']
+                    new_label = pred_dicts[ind]['pred_labels'].clone()
                     pseudo_sem_score = pred_dicts[ind]['pred_sem_scores']
-
+                    new_sem_score = pred_dicts[ind]['pred_sem_scores'].clone()
+                    sample_idx = batch_dict_ema['frame_id'][ind]
                     if len(pseudo_label) == 0:
                         pseudo_boxes.append(pseudo_label.new_zeros((0, 8)).float())
                         continue
 
-
                     conf_thresh = torch.tensor(self.thresh, device=pseudo_label.device).unsqueeze(
                         0).repeat(len(pseudo_label), 1).gather(dim=1, index=(pseudo_label-1).unsqueeze(-1))
-
+                        
+                    newthresh = [0.5,0.25,0.25]
+                    new_thresh = torch.tensor(newthresh, device=pseudo_label.device).unsqueeze(
+                        0).repeat(len(pseudo_label), 1).gather(dim=1, index=(pseudo_label-1).unsqueeze(-1))
+                        
                     valid_inds = pseudo_score > conf_thresh.squeeze()
-
+                    new_valid = pseudo_score > new_thresh.squeeze()
+                    
                     valid_inds = valid_inds * (pseudo_sem_score > self.sem_thresh[0])
+                    new_valid = new_valid * (pseudo_sem_score > 0.6)
 
                     pseudo_sem_score = pseudo_sem_score[valid_inds]
                     pseudo_box = pseudo_box[valid_inds]
                     pseudo_label = pseudo_label[valid_inds]
-
-                    # if len(valid_inds) > max_box_num:
-                    #     _, inds = torch.sort(pseudo_score, descending=True)
-                    #     inds = inds[:max_box_num]
-                    #     pseudo_box = pseudo_box[inds]
-                    #     pseudo_label = pseudo_label[inds]
-
+                    new_box = new_box[new_valid]
+                    new_label = new_label[new_valid]
+                    new_sem_score = new_sem_score[new_valid]
+                    
                     pseudo_boxes.append(torch.cat([pseudo_box, pseudo_label.view(-1, 1).float()], dim=1))
                     if pseudo_box.shape[0] > max_pseudo_box_num:
                         max_pseudo_box_num = pseudo_box.shape[0]
-                    # pseudo_scores.append(pseudo_score)
-                    # pseudo_labels.append(pseudo_label)
+                        
 
-                max_box_num = batch_dict['gt_boxes'].shape[1]
+                new_label = new_label.cpu().numpy()
+                cls_names = ['Car', 'Pedestrian', 'Cyclist']
+                pred = {}
+                pse_box = new_box
+                pse_box = pse_box.cpu().numpy()
+                unpt = un_pot.cpu().numpy()[0]
+                pointslist = []
+                pointpath = []
+                
+                split_dir = self.root_path / 'ImageSets' / ('train_0.10_2' + '.txt')
+                sample_id_list = [x.strip().split(' ')[0] for x in open(split_dir).readlines()] if split_dir.exists() else None
+                
+                if pse_box.shape[0] > 0 and sample_idx not in sample_id_list:
+                    for cls in cls_names:
+                        num_infos = len(self.all_db_infos[cls])
+                        count_infos = 0
+                        for x in range(num_infos):
+                            if self.all_db_infos[cls][count_infos]['image_idx'] == sample_idx:
+                                self.all_db_infos[cls].pop(count_infos)
+                                count_infos -= 1
+                            count_infos += 1
 
+                    pred['name'] = np.array(cls_names)[new_label - 1]
+                    names = pred['name']
+                    pred['frame_id'] = sample_idx
+                    pred['gt_boxes'] = pse_box
+
+                    pred['score'] = new_sem_score.cpu().numpy()
+                    point_indices = roiaware_pool3d_utils.points_in_boxes_cpu(
+                        torch.from_numpy(unpt[:, 0:3]), torch.from_numpy(pse_box)
+                    ).numpy()
+
+                    database_save_path = self.root_path / ('10%_2_6conf-based_trained')
+                    for i in range(pse_box.shape[0]):
+                        gt_points = unpt[point_indices[i] > 0]
+                        gt_points[:, :3] -= pse_box[i, :3]
+                        filename = '%s_%s_%d.bin' % (sample_idx, pred['name'][i], i)
+                        filepath = database_save_path / filename
+                        pointslist.append(gt_points)
+                        pointpath.append(filepath)
+                    
+                        iou_labels = iou3d_nms_utils.boxes_iou3d_gpu(batch_dict_ema['gt_boxes'][1, ...][:, 0:7],
+                                                                     torch.from_numpy(
+                                                                         pred['gt_boxes'][i]).cuda().unsqueeze(
+                                                                         dim=0)).max()
+                        iou_labels = iou_labels.cpu().numpy()
+                        db_path = str(filepath.relative_to(self.data_path))  # gt_database/xxxxx.bin
+                        db_info = {'name': names[i], 'path': db_path, 'image_idx': sample_idx, 'gt_idx': i,
+                                   'box3d_lidar': pred['gt_boxes'][i], 'num_points_in_gt': gt_points.shape[0],
+                                   'iou': iou_labels,
+                                   'score': pred['score'][i]}
+                        self.all_db_infos[names[i]].append(db_info)
+                    
                 # assert max_box_num >= max_pseudo_box_num
                 ori_unlabeled_boxes = batch_dict['gt_boxes'][unlabeled_mask, ...]
 
@@ -235,6 +301,10 @@ class PVRCNN_SSL(Detector3DTemplate):
             ret_dict = {
                 'loss': loss
             }
+            disp_dict['infos'] = self.all_db_infos
+            disp_dict['path'] = self.dbinfo_path
+            disp_dict['points'] = pointslist
+            disp_dict['filepath'] = pointpath
             return ret_dict, tb_dict_, disp_dict
 
         else:
