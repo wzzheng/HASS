@@ -1,5 +1,5 @@
 # Hardness-Aware Scene Synthesis for Semi-Supervised 3D Object Detection
-### [Paper](todo) 
+### [Paper](https://arxiv.org/abs/2405.17422) 
 
 > Hardness-Aware Scene Synthesis for Semi-Supervised 3DObject Detection
 
@@ -13,7 +13,7 @@ HASS proposes a scene synthesis strategy to adaptively generate challenging synt
 
 ## News
 - **[2024/05/28]** Initial code release.
-- **[2024/05/28]** Paper released on [arXiv](todo).
+- **[2024/05/28]** Paper released on [arXiv](https://arxiv.org/abs/2405.17422).
 
 ## Overview
 
