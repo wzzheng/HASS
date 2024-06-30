@@ -78,9 +78,9 @@ class PVRCNN_SSL(Detector3DTemplate):
                 for ind in unlabeled_mask:
                     pseudo_score = pred_dicts[ind]['pred_scores']
                     pseudo_box = pred_dicts[ind]['pred_boxes']
-                    new_box = pred_dicts[ind]['pred_boxes'].clone()
+                    db_boxes = pred_dicts[ind]['pred_boxes'].clone()
                     pseudo_label = pred_dicts[ind]['pred_labels']
-                    new_label = pred_dicts[ind]['pred_labels'].clone()
+                    db_label = pred_dicts[ind]['pred_labels'].clone()
                     pseudo_sem_score = pred_dicts[ind]['pred_sem_scores']
                     new_sem_score = pred_dicts[ind]['pred_sem_scores'].clone()
                     sample_idx = batch_dict_ema['frame_id'][ind]
@@ -96,28 +96,27 @@ class PVRCNN_SSL(Detector3DTemplate):
                         0).repeat(len(pseudo_label), 1).gather(dim=1, index=(pseudo_label-1).unsqueeze(-1))
                         
                     valid_inds = pseudo_score > conf_thresh.squeeze()
-                    new_valid = pseudo_score > new_thresh.squeeze()
+                    db_valid = pseudo_score > new_thresh.squeeze()
                     
                     valid_inds = valid_inds * (pseudo_sem_score > self.sem_thresh[0])
-                    new_valid = new_valid * (pseudo_sem_score > 0.6)
+                    db_valid = db_valid * (pseudo_sem_score > 0.6)
 
                     pseudo_sem_score = pseudo_sem_score[valid_inds]
                     pseudo_box = pseudo_box[valid_inds]
                     pseudo_label = pseudo_label[valid_inds]
-                    new_box = new_box[new_valid]
-                    new_label = new_label[new_valid]
-                    new_sem_score = new_sem_score[new_valid]
+                    db_boxes = db_boxes[db_valid]
+                    db_label = db_label[db_valid]
+                    new_sem_score = new_sem_score[db_valid]
                     
                     pseudo_boxes.append(torch.cat([pseudo_box, pseudo_label.view(-1, 1).float()], dim=1))
                     if pseudo_box.shape[0] > max_pseudo_box_num:
                         max_pseudo_box_num = pseudo_box.shape[0]
                         
 
-                new_label = new_label.cpu().numpy()
+                db_label = db_label.cpu().numpy()
                 cls_names = ['Car', 'Pedestrian', 'Cyclist']
                 pred = {}
-                pse_box = new_box
-                pse_box = pse_box.cpu().numpy()
+                db_boxes = db_boxes.cpu().numpy()
                 unpt = un_pot.cpu().numpy()[0]
                 pointslist = []
                 pointpath = []
@@ -125,7 +124,7 @@ class PVRCNN_SSL(Detector3DTemplate):
                 split_dir = self.root_path / 'ImageSets' / ('train_0.10_2' + '.txt')
                 sample_id_list = [x.strip().split(' ')[0] for x in open(split_dir).readlines()] if split_dir.exists() else None
                 
-                if pse_box.shape[0] > 0 and sample_idx not in sample_id_list:
+                if db_boxes.shape[0] > 0 and sample_idx not in sample_id_list:
                     for cls in cls_names:
                         num_infos = len(self.all_db_infos[cls])
                         count_infos = 0
@@ -135,20 +134,20 @@ class PVRCNN_SSL(Detector3DTemplate):
                                 count_infos -= 1
                             count_infos += 1
 
-                    pred['name'] = np.array(cls_names)[new_label - 1]
+                    pred['name'] = np.array(cls_names)[db_label - 1]
                     names = pred['name']
                     pred['frame_id'] = sample_idx
-                    pred['gt_boxes'] = pse_box
+                    pred['gt_boxes'] = db_boxes
 
                     pred['score'] = new_sem_score.cpu().numpy()
                     point_indices = roiaware_pool3d_utils.points_in_boxes_cpu(
-                        torch.from_numpy(unpt[:, 0:3]), torch.from_numpy(pse_box)
+                        torch.from_numpy(unpt[:, 0:3]), torch.from_numpy(db_boxes)
                     ).numpy()
 
                     database_save_path = self.root_path / ('10%_2_6conf-based_trained')
-                    for i in range(pse_box.shape[0]):
+                    for i in range(db_boxes.shape[0]):
                         gt_points = unpt[point_indices[i] > 0]
-                        gt_points[:, :3] -= pse_box[i, :3]
+                        gt_points[:, :3] -= db_boxes[i, :3]
                         filename = '%s_%s_%d.bin' % (sample_idx, pred['name'][i], i)
                         filepath = database_save_path / filename
                         pointslist.append(gt_points)
@@ -255,7 +254,7 @@ class PVRCNN_SSL(Detector3DTemplate):
 
             for cur_module in self.pv_rcnn.module_list:
                 batch_dict = cur_module(batch_dict)
-
+            info_dict = {}
             disp_dict = {}
             loss_rpn_cls, loss_rpn_box, tb_dict = self.pv_rcnn.dense_head.get_loss(scalar=False)
             loss_point, tb_dict = self.pv_rcnn.point_head.get_loss(tb_dict, scalar=False)
@@ -301,11 +300,11 @@ class PVRCNN_SSL(Detector3DTemplate):
             ret_dict = {
                 'loss': loss
             }
-            disp_dict['infos'] = self.all_db_infos
-            disp_dict['path'] = self.dbinfo_path
-            disp_dict['points'] = pointslist
-            disp_dict['filepath'] = pointpath
-            return ret_dict, tb_dict_, disp_dict
+            info_dict['infos'] = self.all_db_infos
+            info_dict['path'] = self.dbinfo_path
+            info_dict['points'] = pointslist
+            info_dict['filepath'] = pointpath
+            return ret_dict, tb_dict_, disp_dict, info_dict
 
         else:
             for cur_module in self.pv_rcnn.module_list:
